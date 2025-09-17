@@ -56,6 +56,11 @@ type SupportManagerMetrics struct {
 
 	ReceiveQueueSize  *metric.Gauge
 	ReceiveQueueBytes *metric.Gauge
+
+	// // Pacing metrics.
+	// HeartbeatPacingEnabled  *metric.Gauge
+	// HeartbeatPacingBatches  *metric.Counter
+	// HeartbeatPacingDuration metric.IHistogram
 }
 
 func newSupportManagerMetrics() *SupportManagerMetrics {
@@ -78,6 +83,18 @@ func newSupportManagerMetrics() *SupportManagerMetrics {
 		SupportForStores:  metric.NewGauge(metaSupportForStores),
 		ReceiveQueueSize:  metric.NewGauge(metaReceiveQueueSize),
 		ReceiveQueueBytes: metric.NewGauge(metaReceiveQueueBytes),
+
+		// // Pacing metrics
+		// HeartbeatPacingEnabled: metric.NewGauge(metaHeartbeatPacingEnabled),
+		// HeartbeatPacingBatches: metric.NewCounter(metaHeartbeatPacingBatches),
+		// HeartbeatPacingDuration: metric.NewHistogram(
+		// 	metric.HistogramOptions{
+		// 		Mode:         metric.HistogramModePreferHdrLatency,
+		// 		Metadata:     metaHeartbeatPacingDuration,
+		// 		Duration:     base.DefaultHistogramWindowInterval(),
+		// 		BucketConfig: metric.IOLatencyBuckets,
+		// 	},
+		// ),
 	}
 }
 
@@ -207,5 +224,31 @@ var (
 		Help:        "Duration of support withdrawal callback processing",
 		Measurement: "Duration",
 		Unit:        metric.Unit_NANOSECONDS,
+	}
+
+	// Pacing metrics metadata
+	metaHeartbeatPacingEnabled = metric.Metadata{
+		Name:        "storeliveness.heartbeat.pacing.enabled",
+		Help:        "Whether heartbeat pacing is enabled (1) or disabled (0)",
+		Measurement: "Boolean",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaHeartbeatPacingBatches = metric.Metadata{
+		Name:        "storeliveness.heartbeat.pacing.batches",
+		Help:        "Number of heartbeat batches sent when pacing is enabled",
+		Measurement: "Batches",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaHeartbeatPacingDuration = metric.Metadata{
+		Name:        "storeliveness.heartbeat.pacing.duration",
+		Help:        "Duration of paced heartbeat sending operations",
+		Measurement: "Duration",
+		Unit:        metric.Unit_NANOSECONDS,
+	}
+	metaHeartbeatPacingBatchSize = metric.Metadata{
+		Name:        "storeliveness.heartbeat.pacing.batch_size",
+		Help:        "Current batch size used for paced heartbeat sending",
+		Measurement: "Heartbeats",
+		Unit:        metric.Unit_COUNT,
 	}
 )

@@ -7,6 +7,7 @@ package storeliveness
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	slpb "github.com/cockroachdb/cockroach/pkg/kv/kvserver/storeliveness/storelivenesspb"
@@ -97,6 +98,11 @@ func NewSupportManager(
 // Metrics returns metrics tracking this SupportManager.
 func (sm *SupportManager) Metrics() *SupportManagerMetrics {
 	return sm.metrics
+}
+
+// Options returns the options used by this SupportManager.
+func (sm *SupportManager) Options() Options {
+	return sm.options
 }
 
 // HandleMessage implements the MessageHandler interface. It appends incoming
@@ -263,9 +269,11 @@ func (sm *SupportManager) startLoop(ctx context.Context) {
 		case <-sm.storesToAdd.sig:
 			sm.maybeAddStores(ctx)
 			sm.sendHeartbeats(ctx)
+			// sm.sendHeartbeatsPaced(ctx, sm.options.HeartbeatInterval)
 
 		case <-heartbeatTicker.C:
 			sm.sendHeartbeats(ctx)
+			// sm.sendHeartbeatsPaced(ctx, sm.options.HeartbeatInterval)
 
 		case <-supportExpiryTicker.C:
 			sm.withdrawSupport(ctx)
@@ -322,9 +330,15 @@ func (sm *SupportManager) sendHeartbeats(ctx context.Context) {
 
 	// Send heartbeats to each remote store.
 	successes := 0
+	fmt.Printf("length of heartbeats: %d\n", len(heartbeats))
+	fmt.Printf("heartbeats: %+v\n", heartbeats)
+
+	// Send all heartbeats immediately (original behavior)
+	// sm.metrics.HeartbeatPacingEnabled.Update(0) // Disable pacing metric
 	for _, msg := range heartbeats {
 		if sent := sm.sender.SendAsync(ctx, msg); sent {
 			successes++
+			// time.Sleep(100 * time.Millisecond)
 		} else {
 			log.Dev.Warningf(ctx, "failed to send heartbeat to store %+v", msg.To)
 		}
@@ -332,6 +346,185 @@ func (sm *SupportManager) sendHeartbeats(ctx context.Context) {
 	sm.metrics.HeartbeatSuccesses.Inc(int64(successes))
 	sm.metrics.HeartbeatFailures.Inc(int64(len(heartbeats) - successes))
 	log.Dev.VInfof(ctx, 2, "sent heartbeats to %d stores", successes)
+}
+
+// sendHeartbeatsPaced sends heartbeats in paced batches to avoid overwhelming
+// the system with too many concurrent goroutines.
+func (sm *SupportManager) sendHeartbeatsPaced(ctx context.Context, heartbeatInterval time.Duration) {
+	// If Store Liveness is not enabled, don't send heartbeats.
+	if !sm.SupportFromEnabled(ctx) {
+		return
+	}
+	if sm.knobs != nil && sm.knobs.DisableHeartbeats != nil && sm.knobs.DisableHeartbeats.Load() == sm.storeID {
+		return
+	}
+	if sm.knobs != nil && sm.knobs.DisableAllHeartbeats != nil && sm.knobs.DisableAllHeartbeats.Load() {
+		return
+	}
+	rsfu := sm.requesterStateHandler.checkOutUpdate()
+	defer sm.requesterStateHandler.finishUpdate(rsfu)
+	livenessInterval := sm.options.SupportDuration
+	heartbeats := rsfu.getHeartbeatsToSend(sm.storeID, sm.clock.Now(), livenessInterval)
+	if err := rsfu.write(ctx, sm.engine); err != nil {
+		log.Dev.Warningf(ctx, "failed to write requester meta: %v", err)
+		sm.metrics.HeartbeatFailures.Inc(int64(len(heartbeats)))
+		return
+	}
+	sm.requesterStateHandler.checkInUpdate(rsfu)
+
+	fmt.Printf("length of heartbeats: %d\n", len(heartbeats))
+	fmt.Printf("heartbeats: %+v\n", heartbeats)
+
+	// Send heartbeats to each remote store.
+	successes := 0
+	totalHeartbeats := len(heartbeats)
+	if totalHeartbeats == 0 {
+		return
+	}
+
+	// Record pacing metrics
+	// sm.metrics.HeartbeatPacingEnabled.Update(1)
+
+	batchInterval, batchSize, numberOfBatches := calculateHeartbeatDurationAndBatchSizeAndNumberOfBatches(&heartbeats, heartbeatInterval)
+	log.Dev.Infof(ctx, "heartbeat pacing: batchInterval=%vms batchSize=%d numberOfBatches=%d", batchInterval, batchSize, numberOfBatches)
+
+	log.Dev.VInfof(ctx, 2, "sending %d heartbeats in paced batches of %d every %v milliseconds over %v",
+		totalHeartbeats, batchSize, batchInterval, heartbeatInterval)
+
+	ticker := time.NewTicker(time.Duration(batchInterval) * time.Millisecond)
+	defer ticker.Stop()
+
+	log.Dev.Infof(ctx, "starting paced heartbeat sending: %d total heartbeats, %d batches, %dms interval",
+		totalHeartbeats, numberOfBatches, batchInterval)
+
+	batchCount := 0
+	for i := 0; i < totalHeartbeats; i += batchSize {
+		end := i + batchSize
+		if end > totalHeartbeats {
+			end = totalHeartbeats
+		}
+
+		batch := heartbeats[i:end]
+		batchCount++
+
+		log.Dev.Infof(ctx, "sending batch %d/%d: %d heartbeats (stores %d-%d of %d)",
+			batchCount, numberOfBatches, len(batch), i+1, end, totalHeartbeats)
+
+		// Send the current batch
+		batchSuccesses := 0
+		for _, msg := range batch {
+			if sent := sm.sender.SendAsync(ctx, msg); sent {
+				successes++
+				batchSuccesses++
+			} else {
+				log.Dev.Warningf(ctx, "failed to send heartbeat to store %+v", msg.To)
+			}
+		}
+
+		log.Dev.Infof(ctx, "completed batch %d/%d: %d/%d successful, %d/%d total successful",
+			batchCount, numberOfBatches, batchSuccesses, len(batch), successes, totalHeartbeats)
+
+		// Wait for the next batch interval, unless this was the last batch
+		if end < totalHeartbeats {
+			select {
+			case <-ticker.C:
+				// Continue to next batch
+			case <-ctx.Done():
+				log.Dev.Warningf(ctx, "heartbeat pacing interrupted by context cancellation")
+				// Record final metrics
+				// sm.metrics.HeartbeatPacingBatches.Inc(int64(batchCount))
+				// sm.metrics.HeartbeatPacingDuration.RecordValue(timeutil.Since(startTime).Nanoseconds())
+				sm.metrics.HeartbeatSuccesses.Inc(int64(successes))
+				sm.metrics.HeartbeatFailures.Inc(int64(totalHeartbeats - successes))
+				return
+			case <-sm.stopper.ShouldQuiesce():
+				log.Dev.Warningf(ctx, "heartbeat pacing interrupted by stopper")
+				// Record final metrics
+				// sm.metrics.HeartbeatPacingBatches.Inc(int64(batchCount))
+				// sm.metrics.HeartbeatPacingDuration.RecordValue(timeutil.Since(startTime).Nanoseconds())
+				sm.metrics.HeartbeatSuccesses.Inc(int64(successes))
+				sm.metrics.HeartbeatFailures.Inc(int64(totalHeartbeats - successes))
+				return
+			}
+		}
+	}
+
+	// sm.metrics.HeartbeatPacingBatches.Inc(int64(batchCount))
+	// sm.metrics.HeartbeatPacingDuration.RecordValue(timeutil.Since(startTime).Nanoseconds())
+
+	log.Dev.Infof(ctx, "completed paced heartbeat sending: %d/%d heartbeats successful (%d%% success rate)",
+		successes, totalHeartbeats, (successes*100)/totalHeartbeats)
+	sm.metrics.HeartbeatSuccesses.Inc(int64(successes))
+	sm.metrics.HeartbeatFailures.Inc(int64(totalHeartbeats - successes))
+	log.Dev.VInfof(ctx, 2, "sent heartbeats to %d stores", successes)
+}
+
+// Calculates the batch size, interval, and number of batches for
+// paced heartbeat sends per 1 second (1000 milliseconds).
+func calculateHeartbeatDurationAndBatchSizeAndNumberOfBatches(
+	heartbeats *[]slpb.Message,
+	heartbeatInterval time.Duration,
+) (int, int, int) {
+	millisecondsInInterval := int(heartbeatInterval.Milliseconds())
+	numOfHeartbeats := len(*heartbeats)
+
+	var heartbeatsPerMs float64 = float64(numOfHeartbeats) / float64(millisecondsInInterval)
+
+	batchInterval, batchSize := smallestIntegerMultiple(heartbeatsPerMs)
+
+	numberOfBatches := millisecondsInInterval / batchInterval
+
+	return batchInterval, batchSize, numberOfBatches
+}
+
+// gcd calculates the greatest common divisor of two integers.
+func gcd(a, b int) int {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
+}
+
+// floatToFraction converts a float to a reduced fraction.
+func floatToFraction(x float64) (int, int) {
+	if x <= 0 {
+		return 1, 1
+	}
+
+	// Find decimal places by multiplying by powers of 10 until we get an integer.
+	denominator := 1
+	numerator := int(x)
+
+	// Keep multiplying by 10 until we have an integer.
+	for float64(numerator) != x {
+		denominator *= 10
+		numerator = int(x * float64(denominator))
+	}
+
+	// Reduce the fraction.
+	g := gcd(numerator, denominator)
+	return numerator / g, denominator / g
+}
+
+// smallestIntegerMultiple finds the smallest integer multiple
+// to convert a float to a clean integer ratio. Used to calculate
+// the batch size and interval.
+func smallestIntegerMultiple(x float64) (int, int) {
+	if x <= 0 {
+		return 1, 1
+	}
+
+	numerator, denominator := floatToFraction(x)
+
+	// For heartbeats per millisecond, we want:
+	// - intervalMs: how many milliseconds between batches
+	// - batchSize: how many heartbeats per batch.
+	//
+	// If we have 1.2 heartbeats/ms, that's 6/5, so we want:
+	// - Send 6 heartbeats every 5ms.
+	// - intervalMs = 5, batchSize = 6.
+
+	return denominator /* intervalMs */, numerator /* batchSize */
 }
 
 // withdrawSupport delegates support withdrawal to supporterStateHandler.

@@ -69,6 +69,14 @@ func checkSupportFrom(
 func checkSupportFor(
 	t *testing.T, sm *storeliveness.SupportManager, storeID slpb.StoreIdent, supportExpected bool,
 ) {
+	// Use a longer timeout when pacing is enabled to account for the time it takes
+	// to send heartbeats over the full heartbeat interval
+	// timeout := testutils.SucceedsSoonDuration()
+	// if sm.Options().HeartbeatPacingEnabled {
+	// 	// Add extra time for pacing - use 2x the heartbeat interval plus buffer
+	// 	timeout += 2*sm.Options().HeartbeatInterval + 5*time.Second
+	// }
+
 	testutils.SucceedsSoon(
 		t, func() error {
 			_, supportProvided := sm.SupportFor(storeID)
@@ -80,6 +88,7 @@ func checkSupportFor(
 			}
 			return nil
 		},
+		// timeout,
 	)
 }
 
@@ -174,6 +183,35 @@ func TestStoreLivenessAllToAllSupport(t *testing.T) {
 
 	ensureAllToAllSupport(t, tc)
 }
+
+// TestStoreLivenessAllToAllSupportWithPacing tests that each store provides and receives
+// support from all other stores when heartbeat pacing is enabled.
+// func TestStoreLivenessAllToAllSupportWithPacing(t *testing.T) {
+// 	defer leaktest.AfterTest(t)()
+// 	defer log.Scope(t).Close(t)
+// 	TestStoreLivenessAllToAllSupportWithPacing
+// 	// Set environment variable to enable pacing
+// 	oldValue := os.Getenv("COCKROACH_STORE_LIVENESS_HEARTBEAT_PACING_ENABLED")
+// 	defer func() {
+// 		if oldValue == "" {
+// 			err := os.Unsetenv("COCKROACH_STORE_LIVENESS_HEARTBEAT_PACING_ENABLED")
+// 			require.NoError(t, err)
+// 		} else {
+// 			err := os.Setenv("COCKROACH_STORE_LIVENESS_HEARTBEAT_PACING_ENABLED", oldValue)
+// 			require.NoError(t, err)
+// 		}
+// 	}()
+// 	err := os.Setenv("COCKROACH_STORE_LIVENESS_HEARTBEAT_PACING_ENABLED", "true")
+// 	require.NoError(t, err)
+
+// 	ctx := context.Background()
+// 	args := makeMultiStoreArgs(nil) // Don't need to pass enablePacing since we set env var
+// 	tc := testcluster.NewTestCluster(t, numNodes, args)
+// 	tc.Start(t)
+// 	defer tc.Stopper().Stop(ctx)
+
+// 	ensureAllToAllSupport(t, tc)
+// }
 
 // TestStoreLivenessRestart tests that when a node is stopped all its stores
 // lose support; when the node is restarted, all stores re-establish support.

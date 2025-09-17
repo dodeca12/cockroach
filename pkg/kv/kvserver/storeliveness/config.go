@@ -23,6 +23,11 @@ var (
 	defaultIdleSupportFromInterval = envutil.EnvOrDefaultDuration(
 		"COCKROACH_STORE_LIVENESS_IDLE_SUPPORT_FROM_INTERVAL", time.Minute,
 	)
+
+	// defaultHeartbeatPacingEnabled is the default value for HeartbeatPacingEnabled.
+	defaultHeartbeatPacingEnabled = envutil.EnvOrDefaultBool(
+		"COCKROACH_STORE_LIVENESS_HEARTBEAT_PACING_ENABLED", false,
+	)
 )
 
 // Options includes all Store Liveness durations needed by the SupportManager.
@@ -41,6 +46,9 @@ type Options struct {
 	// wait after restart before withdrawing support. It helps prevent support
 	// churn until the first heartbeats are delivered.
 	SupportWithdrawalGracePeriod time.Duration
+	// HeartbeatPacingEnabled enables pacing of heartbeat sends to avoid overwhelming
+	// the system with too many concurrent goroutines.
+	HeartbeatPacingEnabled bool
 }
 
 // NewOptions instantiates the Store Liveness Options.
@@ -55,6 +63,7 @@ func NewOptions(
 		SupportExpiryInterval:        defaultSupportExpiryInterval,
 		IdleSupportFromInterval:      defaultIdleSupportFromInterval,
 		SupportWithdrawalGracePeriod: supportWithdrawalGracePeriod,
+		HeartbeatPacingEnabled:       defaultHeartbeatPacingEnabled,
 	}
 }
 

@@ -205,6 +205,14 @@
 //   process is also aided by synchronizing the sending of heartbeats across all
 //   stores on a given node.
 //
+// - Heartbeat pacing for large clusters. In large clusters with many stores,
+//   sending heartbeats to all stores simultaneously can overwhelm the system
+//   with too many concurrent goroutines. Heartbeat pacing spreads the sending
+//   of heartbeats over time by sending them in small batches at regular calculated
+//   intervals based on the number of heartbeats and the heartbeat interval.
+//   This reduces the peak load on the system while maintaining the same overall
+//   heartbeat frequency.
+//
 // 5.3. Configuration
 //
 // Store liveness can be enabled/disabled using the `kv.store_liveness.enabled`
@@ -219,12 +227,27 @@
 // `RaftConfig.StoreLivenessDurations()` in `base/config.go` in order to stay
 // more closely tuned to Raft parameters.
 //
+// Heartbeat pacing can be configured through the following option:
+//
+// - `HeartbeatPacingEnabled`: Whether to enable heartbeat pacing (default: true)
+//
+// When pacing is enabled, the system automatically calculates an appropriate
+// batch size to distribute heartbeats evenly over the heartbeat interval.
+// For example, with 1200 heartbeats and a 5ms pacing interval, the system
+// will send approximately 6 heartbeats every 5ms over the course of 1 second.
+//
 // 5.4. Observability
 //
 // `TransportMetrics` and `SupportManagerMetrics` in `metrics.go` expose various
 // metrics for monitoring store liveness status, including heartbeat success and
 // failure rates, support relationship statistics (support provided and
 // received), transport-level metrics, and more.
+//
+// Heartbeat pacing metrics include:
+//
+// - `storeliveness.heartbeat.pacing.enabled`: Whether pacing is currently enabled
+// - `storeliveness.heartbeat.pacing.batches`: Number of batches sent
+// - `storeliveness.heartbeat.pacing.duration`: Duration of paced heartbeat operations
 //
 // Store liveness support state is also exposed via `inspectz` endpoints
 // (defined in `inspectz/inspectz.go`):
