@@ -109,7 +109,10 @@ type MessageHandler interface {
 	HandleMessage(msg *slpb.Message) error
 }
 
-var sendQueueSizeLimitReachedErr = errors.Errorf("store liveness send queue is full")
+var (
+	sendQueueSizeLimitReachedErr = errors.Errorf("store liveness send queue is full")
+	errQueueRetired              = errors.New("store liveness send queue retired")
+)
 
 // sendQueue is a queue of outgoing Messages.
 type sendQueue struct {
@@ -119,6 +122,8 @@ type sendQueue struct {
 		msgs []slpb.Message
 		// size is the total size in bytes of the messages in the queue.
 		size int64
+		// retired marks whether the queue has been removed from the transport.
+		retired bool
 	}
 	// sendMessages is signaled by the transport's smearing sender goroutine
 	// to tell processQueue to send messages (smearing mechanism).
@@ -129,8 +134,8 @@ type sendQueue struct {
 	directSend chan struct{}
 }
 
-func newSendQueue() sendQueue {
-	return sendQueue{
+func newSendQueue() *sendQueue {
+	return &sendQueue{
 		sendMessages: make(chan struct{}, 1),
 		directSend:   make(chan struct{}, 1),
 	}
@@ -139,6 +144,9 @@ func newSendQueue() sendQueue {
 func (q *sendQueue) append(msg slpb.Message) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if q.mu.retired {
+		return errQueueRetired
+	}
 	// Drop messages if maxSendQueueSize is reached.
 	if len(q.mu.msgs) >= maxSendQueueSize {
 		return sendQueueSizeLimitReachedErr
@@ -156,6 +164,20 @@ func (q *sendQueue) drain() ([]slpb.Message, int64) {
 	size := q.mu.size
 	q.mu.size = 0
 	return msgs, size
+}
+
+func (q *sendQueue) retire() ([]slpb.Message, int64, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.mu.retired {
+		return nil, 0, false
+	}
+	q.mu.retired = true
+	msgs := q.mu.msgs
+	q.mu.msgs = nil
+	size := q.mu.size
+	q.mu.size = 0
+	return msgs, size, true
 }
 
 func (q *sendQueue) Size() int64 {
@@ -468,26 +490,35 @@ func (t *Transport) EnqueueMessage(ctx context.Context, msg slpb.Message) (enque
 		return false
 	}
 
-	q, existingQueue := t.getQueue(toNodeID)
-	if !existingQueue {
-		// Note that startProcessNewQueue is in charge of deleting the queue.
-		ctx := t.AnnotateCtx(context.Background())
-		if !t.startProcessNewQueue(ctx, toNodeID) {
+	var q *sendQueue
+	var existingQueue bool
+	for {
+		q, existingQueue = t.getQueue(toNodeID)
+		if !existingQueue {
+			// Note that startProcessNewQueue is in charge of deleting the queue.
+			ctx := t.AnnotateCtx(context.Background())
+			if !t.startProcessNewQueue(ctx, toNodeID) {
+				return false
+			}
+			continue
+		}
+		if err := q.append(msg); err != nil {
+			if errors.Is(err, errQueueRetired) {
+				continue
+			}
+			if logQueueFullEvery.ShouldLog() {
+				log.KvExec.Warningf(
+					t.AnnotateCtx(context.Background()),
+					"store liveness send queue to n%d is full", toNodeID,
+				)
+			}
+			t.metrics.MessagesSendDropped.Inc(1)
 			return false
 		}
+		break
 	}
 
 	msgSize := int64(msg.Size())
-	if err := q.append(msg); err != nil {
-		if logQueueFullEvery.ShouldLog() {
-			log.KvExec.Warningf(
-				t.AnnotateCtx(context.Background()),
-				"store liveness send queue to n%d is full", toNodeID,
-			)
-		}
-		t.metrics.MessagesSendDropped.Inc(1)
-		return false
-	}
 
 	// Signal the processQueue goroutine if in direct mode (smearing disabled).
 	if !t.SendHeartbeatsSmeared() {
@@ -513,7 +544,7 @@ func (t *Transport) getQueue(nodeID roachpb.NodeID) (*sendQueue, bool) {
 	queue, ok := t.queues.Load(nodeID)
 	if !ok {
 		q := newSendQueue()
-		queue, ok = t.queues.LoadOrStore(nodeID, &q)
+		queue, ok = t.queues.LoadOrStore(nodeID, q)
 	}
 	return queue, ok
 }
@@ -527,20 +558,25 @@ func (t *Transport) getQueue(nodeID roachpb.NodeID) (*sendQueue, bool) {
 func (t *Transport) startProcessNewQueue(
 	ctx context.Context, toNodeID roachpb.NodeID,
 ) (started bool) {
-	cleanup := func() {
-		q, ok := t.getQueue(toNodeID)
-		if !ok {
+	cleanup := func(expected *sendQueue) {
+		var candidate *sendQueue
+		if expected != nil {
+			candidate = expected
+		} else if current, ok := t.queues.Load(toNodeID); ok {
+			candidate = current
+		} else {
 			return
 		}
-		t.queues.Delete(toNodeID)
-		// Account for all remaining messages in the queue. EnqueueMessage may be
-		// writing to the queue concurrently, so it's possible that we won't
-		// account for a few messages below.
-		msgs, msgsSize := q.drain()
-		if len(msgs) > 0 {
-			t.metrics.MessagesSendDropped.Inc(int64(len(msgs)))
-			t.metrics.SendQueueSize.Dec(int64(len(msgs)))
-			t.metrics.SendQueueBytes.Dec(msgsSize)
+		msgs, msgsSize, retired := candidate.retire()
+		if retired {
+			if current, ok := t.queues.Load(toNodeID); ok && current == candidate {
+				t.queues.Delete(toNodeID)
+			}
+			if len(msgs) > 0 {
+				t.metrics.MessagesSendDropped.Inc(int64(len(msgs)))
+				t.metrics.SendQueueSize.Dec(int64(len(msgs)))
+				t.metrics.SendQueueBytes.Dec(msgsSize)
+			}
 		}
 	}
 	worker := func(ctx context.Context) {
@@ -548,7 +584,7 @@ func (t *Transport) startProcessNewQueue(
 		if !existingQueue {
 			log.KvExec.Fatalf(ctx, "queue for n%d does not exist", toNodeID)
 		}
-		defer cleanup()
+		defer cleanup(q)
 		client, err := slpb.DialStoreLivenessClient(t.dialer, ctx, toNodeID, connClass)
 		if err != nil {
 			// DialNode already logs sufficiently, so just return.
@@ -574,7 +610,7 @@ func (t *Transport) startProcessNewQueue(
 		},
 	)
 	if err != nil {
-		cleanup()
+		cleanup(nil)
 		return false
 	}
 	return true
